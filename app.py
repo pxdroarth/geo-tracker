@@ -1,40 +1,38 @@
- 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from sqlalchemy import create_engine, Column, String, Float, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-import datetime
-import uuid
-import os
+from fastapi.responses import HTMLResponse
 import requests
+import os
+import uuid
+import asyncpg
+from datetime import datetime
 
 app = FastAPI()
 
+# Pega a URL do banco que o Railway injeta automaticamente
 DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise Exception("DATABASE_URL não configurada")
 
-engine = create_engine(DATABASE_URL)
-Base = declarative_base()
-SessionLocal = sessionmaker(bind=engine)
+async def init_db():
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute('''
+        CREATE TABLE IF NOT EXISTS locations (
+            id TEXT PRIMARY KEY,
+            ip TEXT,
+            lat REAL,
+            lon REAL,
+            city TEXT,
+            region TEXT,
+            country TEXT,
+            isp TEXT,
+            created_at TIMESTAMP
+        )
+    ''')
+    await conn.close()
 
-class Location(Base):
-    __tablename__ = "locations"
-    id = Column(String, primary_key=True)
-    ip = Column(String)
-    lat = Column(Float)
-    lon = Column(Float)
-    city = Column(String)
-    region = Column(String)
-    country = Column(String)
-    isp = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-
-Base.metadata.create_all(bind=engine)
+@app.on_event("startup")
+async def startup():
+    await init_db()
 
 def get_ip_location(ip: str):
-    """Usa ip-api.com (gratuito, sem chave, 45 req/min)"""
     try:
         resp = requests.get(f"http://ip-api.com/json/{ip}?fields=status,lat,lon,city,region,countryCode,isp", timeout=5)
         data = resp.json()
@@ -42,13 +40,13 @@ def get_ip_location(ip: str):
             return {
                 "lat": data["lat"],
                 "lon": data["lon"],
-                "city": data.get("city"),
-                "region": data.get("region"),
-                "country": data.get("countryCode"),
-                "isp": data.get("isp")
+                "city": data.get("city", ""),
+                "region": data.get("region", ""),
+                "country": data.get("countryCode", ""),
+                "isp": data.get("isp", "")
             }
-    except Exception as e:
-        print(f"Erro IP geolocation: {e}")
+    except:
+        pass
     return None
 
 @app.get("/", response_class=HTMLResponse)
@@ -56,26 +54,14 @@ async def index():
     html = """
     <!DOCTYPE html>
     <html>
-    <head>
-        <title>Tracker</title>
-        <style>
-            body { font-family: monospace; padding: 2rem; text-align: center; }
-            .hidden { display: none; }
-        </style>
-    </head>
+    <head><title>Tracker</title></head>
     <body>
         <h1>Hello World</h1>
-        <p>Redirecionando...</p>
         <script>
             fetch('/track')
                 .then(r => r.json())
-                .then(data => {
-                    console.log('Location tracked:', data);
-                    document.body.innerHTML = '<h1>Hello World</h1><p>Status: OK</p>';
-                })
-                .catch(err => {
-                    document.body.innerHTML = '<h1>Hello World</h1><p>Erro: ' + err + '</p>';
-                });
+                .then(data => console.log('Tracked:', data))
+                .catch(err => console.log('Error:', err));
         </script>
     </body>
     </html>
@@ -84,63 +70,39 @@ async def index():
 
 @app.get("/track")
 async def track(request: Request):
-    # Pega IP real (Render usa proxy)
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
-    else:
-        client_ip = request.client.host
+    client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
     
-    # Se for IP local ou de teste, usa um público
     if client_ip in ["127.0.0.1", "localhost", "::1"]:
-        client_ip = "8.8.8.8"  # IP de exemplo
+        client_ip = "8.8.8.8"
     
     loc_data = get_ip_location(client_ip)
-    
     if not loc_data:
-        return JSONResponse({"error": "Não foi possível localizar"}, status_code=404)
+        return {"error": "localizacao nao encontrada"}
     
-    db = SessionLocal()
+    conn = await asyncpg.connect(DATABASE_URL)
     record_id = str(uuid.uuid4())[:8]
-    new_loc = Location(
-        id=record_id,
-        ip=client_ip,
-        lat=loc_data["lat"],
-        lon=loc_data["lon"],
-        city=loc_data["city"],
-        region=loc_data["region"],
-        country=loc_data["country"],
-        isp=loc_data.get("isp")
-    )
-    db.add(new_loc)
-    db.commit()
-    db.close()
+    await conn.execute('''
+        INSERT INTO locations (id, ip, lat, lon, city, region, country, isp, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    ''', record_id, client_ip, loc_data["lat"], loc_data["lon"],
+        loc_data["city"], loc_data["region"], loc_data["country"],
+        loc_data["isp"], datetime.utcnow())
+    await conn.close()
     
-    return {
-        "id": record_id,
-        "ip": client_ip,
-        "lat": loc_data["lat"],
-        "lon": loc_data["lon"],
-        "city": loc_data["city"],
-        "region": loc_data["region"],
-        "country": loc_data["country"]
-    }
+    return {"id": record_id, "lat": loc_data["lat"], "lon": loc_data["lon"]}
 
-@app.get("/admin/locations")
-async def list_locations():
-    db = SessionLocal()
-    locs = db.query(Location).order_by(Location.created_at.desc()).limit(100).all()
-    db.close()
-    return [
-        {
-            "id": l.id,
-            "ip": l.ip,
-            "lat": l.lat,
-            "lon": l.lon,
-            "city": l.city,
-            "region": l.region,
-            "country": l.country,
-            "created_at": l.created_at.isoformat()
-        }
-        for l in locs
-    ]
+@app.get("/admin")
+async def admin():
+    conn = await asyncpg.connect(DATABASE_URL)
+    rows = await conn.fetch('''
+        SELECT id, ip, lat, lon, city, region, country, isp, created_at
+        FROM locations ORDER BY created_at DESC LIMIT 50
+    ''')
+    await conn.close()
+    
+    html = "<h1>📍 Localizações capturadas</h1><table border='1'><tr><th>ID</th><th>IP</th><th>Lat</th><th>Lon</th><th>Cidade</th><th>Região</th><th>País</th><th>ISP</th><th>Data</th></tr>"
+    for r in rows:
+        html += f"<tr><td>{r['id']}</td><td>{r['ip']}</td><td>{r['lat']}</td><td>{r['lon']}</td><td>{r['city']}</td><td>{r['region']}</td><td>{r['country']}</td><td>{r['isp']}</td><td>{r['created_at']}</td></tr>"
+    html += "</table>"
+    return HTMLResponse(html)
