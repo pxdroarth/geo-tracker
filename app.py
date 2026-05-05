@@ -1,19 +1,19 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 import requests
+import sqlite3
 import os
 import uuid
-import asyncpg
 from datetime import datetime
 
 app = FastAPI()
 
-# Pega a URL do banco que o Railway injeta automaticamente
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = "/tmp/locations.db"
 
-async def init_db():
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute('''
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
         CREATE TABLE IF NOT EXISTS locations (
             id TEXT PRIMARY KEY,
             ip TEXT,
@@ -23,14 +23,13 @@ async def init_db():
             region TEXT,
             country TEXT,
             isp TEXT,
-            created_at TIMESTAMP
+            created_at TEXT
         )
     ''')
-    await conn.close()
+    conn.commit()
+    conn.close()
 
-@app.on_event("startup")
-async def startup():
-    await init_db()
+init_db()
 
 def get_ip_location(ip: str):
     try:
@@ -72,7 +71,6 @@ async def index():
 async def track(request: Request):
     forwarded = request.headers.get("x-forwarded-for")
     client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
-    
     if client_ip in ["127.0.0.1", "localhost", "::1"]:
         client_ip = "8.8.8.8"
     
@@ -80,29 +78,32 @@ async def track(request: Request):
     if not loc_data:
         return {"error": "localizacao nao encontrada"}
     
-    conn = await asyncpg.connect(DATABASE_URL)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     record_id = str(uuid.uuid4())[:8]
-    await conn.execute('''
+    c.execute('''
         INSERT INTO locations (id, ip, lat, lon, city, region, country, isp, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    ''', record_id, client_ip, loc_data["lat"], loc_data["lon"],
-        loc_data["city"], loc_data["region"], loc_data["country"],
-        loc_data["isp"], datetime.utcnow())
-    await conn.close()
-    
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (record_id, client_ip, loc_data["lat"], loc_data["lon"],
+          loc_data["city"], loc_data["region"], loc_data["country"],
+          loc_data["isp"], datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
     return {"id": record_id, "lat": loc_data["lat"], "lon": loc_data["lon"]}
 
 @app.get("/admin")
 async def admin():
-    conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch('''
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
         SELECT id, ip, lat, lon, city, region, country, isp, created_at
         FROM locations ORDER BY created_at DESC LIMIT 50
     ''')
-    await conn.close()
+    rows = c.fetchall()
+    conn.close()
     
-    html = "<h1>📍 Localizações capturadas</h1><table border='1'><tr><th>ID</th><th>IP</th><th>Lat</th><th>Lon</th><th>Cidade</th><th>Região</th><th>País</th><th>ISP</th><th>Data</th></tr>"
+    html = "<h1>📍 Localizações</h1><table border='1'><tr><th>ID</th><th>IP</th><th>Lat</th><th>Lon</th><th>Cidade</th><th>Região</th><th>País</th><th>ISP</th><th>Data</th></tr>"
     for r in rows:
-        html += f"<tr><td>{r['id']}</td><td>{r['ip']}</td><td>{r['lat']}</td><td>{r['lon']}</td><td>{r['city']}</td><td>{r['region']}</td><td>{r['country']}</td><td>{r['isp']}</td><td>{r['created_at']}</td></tr>"
+        html += f"<tr><td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td><td>{r[4]}</td><td>{r[5]}</td><td>{r[6]}</td><td>{r[7]}</td><td>{r[8]}</td></tr>"
     html += "</table>"
     return HTMLResponse(html)
